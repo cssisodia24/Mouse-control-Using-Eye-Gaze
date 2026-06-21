@@ -1,0 +1,290 @@
+import cv2
+import numpy as np
+import mediapipe as mp
+import pyautogui
+import time
+
+# --- MEDIAPIPE SETUP ---
+print("Loading MediaPipe models...")
+mp_face_mesh = mp.solutions.face_mesh
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+
+face_mesh = mp_face_mesh.FaceMesh(
+    static_image_mode=False,
+    max_num_faces=1,
+    refine_landmarks=True,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
+
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=1,
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.5
+)
+
+# --- CONFIGURATION ---
+# Smoothing parameters for head pose
+alpha = 0.7
+smoothed_yaw = None
+smoothed_pitch = None
+smoothed_roll = None
+
+# Click detection parameters
+click_cooldown = 0.5  # Seconds between clicks
+last_click_time = 0
+
+# Scroll detection parameters
+scroll_active = False
+last_scroll_y = None
+scroll_threshold = 0.05  # Pinch distance threshold
+scroll_sensitivity = 2
+
+# MediaPipe 6-point model indices for head pose
+LANDMARK_IDS = [1, 133, 362, 234, 454, 152]
+
+# 3D model points for MediaPipe
+MODEL_POINTS = np.array([
+    (0.0, 0.0, 0.0),    # Nose Tip
+    (-30.0, -30.0, -30.0),  # Left Eye
+    (30.0, -30.0, -30.0),   # Right Eye
+    (-60.0, 60.0, -60.0),   # Left Ear
+    (60.0, 60.0, -60.0),    # Right Ear
+    (0.0, 100.0, -100.0)    # Chin
+], dtype=np.float32)
+
+# Camera Parameters
+FOCAL_LENGTH = 1
+CENTER = (0, 0)
+
+def rotation_matrix_to_euler_angles(R):
+    """Converts a rotation matrix to Euler angles (yaw, pitch, roll)"""
+    yaw = np.arctan2(R[1, 0], R[0, 0]) * (180.0 / np.pi)
+    pitch = np.arctan2(-R[2, 0], np.sqrt(R[2, 1]**2 + R[2, 2]**2)) * (180.0 / np.pi)
+    roll = np.arctan2(R[2, 1], R[2, 2]) * (180.0 / np.pi)
+    return yaw, pitch, roll
+
+def estimate_head_pose(image):
+    """Estimates head pose using MediaPipe FaceMesh"""
+    global FOCAL_LENGTH, CENTER
+    img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    results = face_mesh.process(img_rgb)
+
+    if not results.multi_face_landmarks:
+        return None
+
+    face_landmarks = results.multi_face_landmarks[0]
+    ih, iw = image.shape[:2]
+
+    # Get 2D image points from MediaPipe
+    image_points = np.array([
+        [face_landmarks.landmark[i].x * iw, face_landmarks.landmark[i].y * ih]
+        for i in LANDMARK_IDS
+    ], dtype=np.float32)
+
+    # Camera Intrinsics
+    FOCAL_LENGTH = iw
+    CENTER = (iw/2, ih/2)
+    CAMERA_MATRIX = np.array([
+        [FOCAL_LENGTH, 0, CENTER[0]],
+        [0, FOCAL_LENGTH, CENTER[1]],
+        [0, 0, 1]
+    ], dtype=np.float32)
+
+    DIST_COEFFS = np.zeros((4, 1))  # No distortion
+
+    # SolvePnP
+    success, rotation_vector, _ = cv2.solvePnP(
+        MODEL_POINTS, image_points, CAMERA_MATRIX, DIST_COEFFS
+    )
+
+    if not success:
+        return None
+
+    rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
+    yaw, pitch, roll = rotation_matrix_to_euler_angles(rotation_matrix)
+    yaw = -yaw  # Adjust sign
+
+    # Get face center (use nose tip)
+    face_x = image_points[0][0]
+    face_y = image_points[0][1]
+
+    return {
+        "yaw": yaw,
+        "pitch": pitch,
+        "roll": roll,
+        "face": {"x": face_x, "y": face_y}
+    }
+
+def detect_fist(hand_landmarks):
+    """Detects if hand is making a fist gesture"""
+    # Check if all fingertips are below their PIP joints
+    fingers_down = []
+
+    # Index finger
+    fingers_down.append(
+        hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP].y >
+        hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_PIP].y
+    )
+
+    # Middle finger
+    fingers_down.append(
+        hand_landmarks.landmark[mp_hands.HandLandmark.MIDDLE_FINGER_TIP].y >
+        hand_landmarks.landmark[mp_hands.HandLandmark.MIDDLE_FINGER_PIP].y
+    )
+
+    # Ring finger
+    fingers_down.append(
+        hand_landmarks.landmark[mp_hands.HandLandmark.RING_FINGER_TIP].y >
+        hand_landmarks.landmark[mp_hands.HandLandmark.RING_FINGER_PIP].y
+    )
+
+    # Pinky finger
+    fingers_down.append(
+        hand_landmarks.landmark[mp_hands.HandLandmark.PINKY_TIP].y >
+        hand_landmarks.landmark[mp_hands.HandLandmark.PINKY_PIP].y
+    )
+
+    return all(fingers_down)
+
+def detect_pinch(hand_landmarks):
+    """Detects pinch gesture and returns distance between thumb and index finger"""
+    thumb_tip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP]
+    index_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+
+    # Calculate Euclidean distance
+    distance = np.sqrt(
+        (thumb_tip.x - index_tip.x)**2 +
+        (thumb_tip.y - index_tip.y)**2
+    )
+
+    return distance
+
+def draw_info(img, gaze, hand_gesture, fps):
+    """Draws information overlay on frame"""
+    # Draw gaze arrow
+    if gaze:
+        face = gaze["face"]
+        arrow_length = img.shape[1] / 3
+        dx = -arrow_length * np.sin(np.radians(gaze["yaw"]))
+        dy = -arrow_length * np.sin(np.radians(gaze["pitch"]))
+
+        cv2.arrowedLine(
+            img,
+            (int(face["x"]), int(face["y"])),
+            (int(face["x"] + dx), int(face["y"] + dy)),
+            (0, 0, 255), 2, cv2.LINE_AA, tipLength=0.2
+        )
+
+    # Display angles
+    cv2.putText(img, f"Yaw: {gaze['yaw']:.1f}", (20, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+    cv2.putText(img, f"Pitch: {gaze['pitch']:.1f}", (20, 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+
+    # Display gesture status
+    if hand_gesture:
+        cv2.putText(img, f"Gesture: {hand_gesture}", (20, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+    # Display FPS
+    cv2.putText(img, f"FPS: {fps:.1f}", (20, 120),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+# --- MAIN LOOP ---
+print("Starting integrated gaze and gesture control system...")
+cap = cv2.VideoCapture(0)
+cv2.namedWindow("Gaze Controller with Gestures")
+
+while cap.isOpened():
+    start_time = time.time()
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame = cv2.flip(frame, 1)  # Mirror for intuitive control
+    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    # --- HEAD POSE ESTIMATION ---
+    gaze_data = estimate_head_pose(frame)
+
+    if gaze_data:
+        # Apply smoothing
+        if smoothed_yaw is None:
+            smoothed_yaw = gaze_data["yaw"]
+            smoothed_pitch = gaze_data["pitch"]
+        else:
+            smoothed_yaw = alpha * gaze_data["yaw"] + (1 - alpha) * smoothed_yaw
+            smoothed_pitch = alpha * gaze_data["pitch"] + (1 - alpha) * smoothed_pitch
+
+        gaze_data["yaw"] = smoothed_yaw
+        gaze_data["pitch"] = smoothed_pitch
+
+        # --- MOUSE CURSOR CONTROL ---
+        screen_width, screen_height = pyautogui.size()
+
+        # Map head pose to screen coordinates
+        target_x = screen_width * (gaze_data["yaw"] + 40) / 80
+        target_y = screen_height * (gaze_data["pitch"] + 30) / 60
+
+        target_x = np.clip(target_x, 0, screen_width - 1)
+        target_y = np.clip(target_y, 0, screen_height - 1)
+
+        pyautogui.moveTo(target_x, target_y, duration=0)
+
+    # --- HAND GESTURE DETECTION ---
+    hand_results = hands.process(img_rgb)
+    hand_gesture = None
+
+    if hand_results.multi_hand_landmarks:
+        for hand_landmarks in hand_results.multi_hand_landmarks:
+            # Draw hand landmarks
+            mp_drawing.draw_landmarks(
+                frame,
+                hand_landmarks,
+                mp_hands.HAND_CONNECTIONS
+            )
+
+            # Detect fist for clicking
+            if detect_fist(hand_landmarks):
+                current_time = time.time()
+                if current_time - last_click_time > click_cooldown:
+                    pyautogui.click()
+                    last_click_time = current_time
+                    hand_gesture = "CLICK"
+
+            # Detect pinch for scrolling
+            pinch_distance = detect_pinch(hand_landmarks)
+
+            if pinch_distance < scroll_threshold:
+                hand_gesture = "SCROLL"
+                index_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+
+                if last_scroll_y is not None:
+                    scroll_delta = (last_scroll_y - index_tip.y) * scroll_sensitivity * 100
+                    if abs(scroll_delta) > 10:  # Minimum movement threshold
+                        pyautogui.scroll(int(scroll_delta))
+
+                last_scroll_y = index_tip.y
+            else:
+                last_scroll_y = None
+
+    # Calculate FPS
+    processing_time = time.time() - start_time
+    fps = 1 / processing_time if processing_time > 0 else 0
+
+    # Draw overlay
+    draw_info(frame, gaze_data, hand_gesture, fps)
+
+    # Display frame
+    cv2.imshow("Gaze Controller with Gestures", frame)
+
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+face_mesh.close()
+hands.close()
